@@ -15,7 +15,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, HttpUrl
 
-app = FastAPI(title="SocMed Resolver", version="1.0.5")
+app = FastAPI(title="SocMed Resolver", version="1.0.6")
 
 ALLOWED_HOSTS = {
     "instagram.com", "www.instagram.com",
@@ -95,7 +95,7 @@ def sign_media_url(remote_url: str, ext: str = "bin") -> str:
     payload = base64.urlsafe_b64encode(remote_url.encode()).decode().rstrip("=")
     signature = hmac.new(MEDIA_SIGNING_KEY, payload.encode(), hashlib.sha256).hexdigest()[:32]
     safe_ext = ext.lower() if ext.lower() in {"jpg", "jpeg", "png", "webp", "gif", "mp4", "mov", "m4v"} else "bin"
-    return f"{PUBLIC_BASE_URL}/media/{payload}.{signature}/instagram-media.{safe_ext}"
+    return f"{PUBLIC_BASE_URL}/download/instagram-media.{safe_ext}?token={payload}.{signature}"
 
 
 def decode_media_token(token: str) -> str:
@@ -252,16 +252,18 @@ def detect_media(data: bytes, declared_type: str, remote_url: str) -> tuple[str,
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "socmed-resolver", "version": "1.0.5"}
+    return {"ok": True, "service": "socmed-resolver", "version": "1.0.6"}
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "1.0.5"}
+    return {"ok": True, "version": "1.0.6"}
 
 
+@app.get("/download/{filename}")
 @app.get("/media/{token}/{filename}")
-async def media_proxy(token: str, filename: str):
+@app.get("/media/{token}")
+async def media_proxy(token: str, filename: str = "instagram-media"):
     remote_url = decode_media_token(token)
     header_profiles = [
         {"User-Agent": IOS_UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"},
@@ -313,7 +315,7 @@ async def resolve(req: ResolveRequest, authorization: str | None = Header(defaul
 
     if is_instagram:
         try:
-            media = await resolve_instagram(url)
+            media = proxy_instagram_media(await resolve_instagram(url))
             return {"ok": True, "source": host, "title": None,
                     "media": media, "provider": "instasave"}
         except Exception:
