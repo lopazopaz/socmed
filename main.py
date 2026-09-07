@@ -15,7 +15,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, HttpUrl
 
-app = FastAPI(title="SocMed Resolver", version="1.0.6")
+app = FastAPI(title="SocMed Resolver", version="1.0.7")
 
 ALLOWED_HOSTS = {
     "instagram.com", "www.instagram.com",
@@ -231,6 +231,25 @@ async def resolve_instagram(url: str) -> list[dict[str, Any]]:
     return media
 
 
+
+def instagram_shortcode(url: str) -> str:
+    match = re.search(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", urlparse(url).path)
+    if not match:
+        raise ValueError("Invalid Instagram post URL")
+    return match.group(1)
+
+
+def instagram_delivery_urls(post_url: str, media: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    shortcode = instagram_shortcode(post_url)
+    delivered = []
+    for index, item in enumerate(media):
+        copy = {key: value for key, value in item.items() if key != "url"}
+        ext = str(copy.get("ext") or ("mp4" if copy.get("type") == "video" else "jpg"))
+        copy["url"] = f"{PUBLIC_BASE_URL}/instagram/{shortcode}/{index}/media.{ext}"
+        delivered.append(copy)
+    return delivered
+
+
 def detect_media(data: bytes, declared_type: str, remote_url: str) -> tuple[str, str] | None:
     declared = (declared_type or "").split(";", 1)[0].lower()
     if data.startswith(b"\xff\xd8\xff"):
@@ -252,19 +271,32 @@ def detect_media(data: bytes, declared_type: str, remote_url: str) -> tuple[str,
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "socmed-resolver", "version": "1.0.6"}
+    return {"ok": True, "service": "socmed-resolver", "version": "1.0.7"}
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "1.0.6"}
+    return {"ok": True, "version": "1.0.7"}
 
 
-@app.get("/download/{filename}")
-@app.get("/media/{token}/{filename}")
-@app.get("/media/{token}")
-async def media_proxy(token: str, filename: str = "instagram-media"):
-    remote_url = decode_media_token(token)
+@app.get("/instagram/{shortcode}/{index}/{filename}")
+async def instagram_download(shortcode: str, index: int, filename: str):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{5,30}", shortcode) or index < 0 or index > 50:
+        raise HTTPException(status_code=400, detail="Invalid Instagram media request")
+    post_url = f"https://www.instagram.com/p/{shortcode}/"
+    try:
+        items = await resolve_instagram(post_url)
+        if index >= len(items):
+            raise HTTPException(status_code=404, detail="Instagram media item not found")
+        remote_url = items[index]["url"]
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not retrieve Instagram download")
+    return await fetch_remote_media(remote_url, filename)
+
+
+async def fetch_remote_media(remote_url: str, filename: str = "media"):
     header_profiles = [
         {"User-Agent": IOS_UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"},
         INSTAGRAM_HEADERS,
@@ -289,19 +321,27 @@ async def media_proxy(token: str, filename: str = "instagram-media"):
                     last_error = f"Unexpected content type: {response.headers.get('content-type', 'unknown')}"
                     continue
                 media_type, ext = detected
+                stem = re.sub(r"[^A-Za-z0-9_-]", "-", filename.rsplit(".", 1)[0]) or "instagram-media"
                 return Response(
                     content=data,
                     media_type=media_type,
                     headers={
-                        "Content-Disposition": f'attachment; filename="instagram-media.{ext}"',
+                        "Content-Disposition": f'attachment; filename="{stem}.{ext}"',
                         "Cache-Control": "private, max-age=300",
-                        "Cross-Origin-Resource-Policy": "cross-origin",
                         "X-Content-Type-Options": "nosniff",
                     },
                 )
             except Exception as exc:
                 last_error = str(exc)
     raise HTTPException(status_code=502, detail=f"Could not fetch Instagram media: {last_error}")
+
+
+@app.get("/download/{filename}")
+@app.get("/media/{token}/{filename}")
+@app.get("/media/{token}")
+async def media_proxy(token: str, filename: str = "instagram-media"):
+    remote_url = decode_media_token(token)
+    return await fetch_remote_media(remote_url, filename)
 
 
 @app.post("/resolve")
@@ -315,7 +355,7 @@ async def resolve(req: ResolveRequest, authorization: str | None = Header(defaul
 
     if is_instagram:
         try:
-            media = proxy_instagram_media(await resolve_instagram(url))
+            media = instagram_delivery_urls(url, await resolve_instagram(url))
             return {"ok": True, "source": host, "title": None,
                     "media": media, "provider": "instasave"}
         except Exception:
