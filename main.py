@@ -10,10 +10,10 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 from pydantic import BaseModel, HttpUrl
 
-app = FastAPI(title="SocMed Resolver", version="1.0.2")
+app = FastAPI(title="SocMed Resolver", version="1.0.3")
 
 ALLOWED_HOSTS = {
     "instagram.com", "www.instagram.com",
@@ -29,8 +29,9 @@ COOKIES_B64 = os.getenv("COOKIES_B64", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://socmed.wasmer.app").rstrip("/")
 MEDIA_SIGNING_KEY = (os.getenv("SOCMED_MEDIA_SECRET", "").strip() or API_KEY or "socmed-local-media-key").encode()
 
+IOS_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
 INSTAGRAM_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
+    "User-Agent": IOS_UA,
     "Referer": "https://www.instagram.com/",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -123,7 +124,6 @@ def proxy_instagram_media(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def media_from_info(info: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-
     entries = info.get("entries")
     if entries:
         for entry in entries:
@@ -135,7 +135,6 @@ def media_from_info(info: dict[str, Any]) -> list[dict[str, Any]]:
     ext = (info.get("ext") or "").lower()
     vcodec = info.get("vcodec")
     acodec = info.get("acodec")
-
     image_exts = {"jpg", "jpeg", "png", "webp", "gif"}
     video_exts = {"mp4", "mov", "m4v", "webm"}
 
@@ -146,15 +145,11 @@ def media_from_info(info: dict[str, Any]) -> list[dict[str, Any]]:
             out.append({"type": "video", "url": direct_url, "ext": ext or "mp4"})
 
     for item in info.get("requested_downloads") or []:
-        url = item.get("url")
-        if not url:
+        item_url = item.get("url")
+        if not item_url:
             continue
         item_ext = (item.get("ext") or "").lower()
-        out.append({
-            "type": "image" if item_ext in image_exts else "video",
-            "url": url,
-            "ext": item_ext or "mp4",
-        })
+        out.append({"type": "image" if item_ext in image_exts else "video", "url": item_url, "ext": item_ext or "mp4"})
 
     if not out and info.get("thumbnail"):
         thumb = info["thumbnail"]
@@ -167,66 +162,92 @@ async def og_fallback(url: str) -> list[dict[str, Any]]:
     async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers=INSTAGRAM_HEADERS) as client:
         response = await client.get(url)
         response.raise_for_status()
-
     soup = BeautifulSoup(response.text, "html.parser")
     media: list[dict[str, Any]] = []
-
     for prop in ["og:video:secure_url", "og:video", "twitter:player:stream"]:
         tags = soup.find_all("meta", attrs={"property": prop}) + soup.find_all("meta", attrs={"name": prop})
         for tag in tags:
             content = tag.get("content")
             if content:
                 media.append({"type": "video", "url": content, "ext": guess_ext(content, "mp4")})
-
     for prop in ["og:image:secure_url", "og:image", "twitter:image"]:
         tags = soup.find_all("meta", attrs={"property": prop}) + soup.find_all("meta", attrs={"name": prop})
         for tag in tags:
             content = tag.get("content")
             if content:
                 media.append({"type": "image", "url": content, "ext": guess_ext(content, "jpg")})
-
     return dedupe(media)
+
+
+def detect_media(data: bytes, declared_type: str, remote_url: str) -> tuple[str, str] | None:
+    declared = (declared_type or "").split(";", 1)[0].lower()
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", "jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", "png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif", "gif"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return "video/mp4", "mp4"
+    if declared.startswith("image/"):
+        return declared, guess_ext(remote_url, declared.split("/", 1)[1].replace("jpeg", "jpg"))
+    if declared.startswith("video/"):
+        return declared, guess_ext(remote_url, "mp4")
+    return None
 
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "socmed-resolver", "version": "1.0.2"}
+    return {"ok": True, "service": "socmed-resolver", "version": "1.0.3"}
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "1.0.2"}
+    return {"ok": True, "version": "1.0.3"}
 
 
 @app.get("/media/{token}")
 async def media_proxy(token: str):
     remote_url = decode_media_token(token)
-
-    async def stream_remote():
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60, headers=INSTAGRAM_HEADERS) as client:
-            async with client.stream("GET", remote_url) as response:
+    header_profiles = [
+        {"User-Agent": IOS_UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"},
+        INSTAGRAM_HEADERS,
+        {"User-Agent": "Mozilla/5.0", "Accept": "*/*", "Referer": "https://www.instagram.com/"},
+    ]
+    last_error = "Instagram CDN did not return valid media bytes"
+    async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+        for headers in header_profiles:
+            try:
+                response = await client.get(remote_url, headers=headers)
                 response.raise_for_status()
-                async for chunk in response.aiter_bytes():
-                    yield chunk
-
-    # Probe headers first so iOS receives the actual MIME type instead of generic data.
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers=INSTAGRAM_HEADERS) as client:
-            async with client.stream("GET", remote_url) as response:
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "application/octet-stream").split(";", 1)[0]
-                content_length = response.headers.get("content-length")
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Could not fetch media: {exc}")
-
-    headers = {
-        "Cache-Control": "private, max-age=300",
-        "Content-Disposition": "inline",
-    }
-    if content_length:
-        headers["Content-Length"] = content_length
-
-    return StreamingResponse(stream_remote(), media_type=content_type, headers=headers)
+                data = response.content
+                if not data:
+                    last_error = "Instagram CDN returned an empty body"
+                    continue
+                head = data[:512].lstrip().lower()
+                if head.startswith(b"<!doctype html") or head.startswith(b"<html"):
+                    last_error = "Instagram CDN returned HTML instead of media"
+                    continue
+                detected = detect_media(data, response.headers.get("content-type", ""), remote_url)
+                if not detected:
+                    last_error = f"Unexpected content type: {response.headers.get('content-type', 'unknown')}"
+                    continue
+                media_type, ext = detected
+                return Response(
+                    content=data,
+                    media_type=media_type,
+                    headers={
+                        "Content-Disposition": f'attachment; filename="instagram-media.{ext}"',
+                        "Cache-Control": "private, max-age=300",
+                        "Cross-Origin-Resource-Policy": "cross-origin",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
+            except Exception as exc:
+                last_error = str(exc)
+    raise HTTPException(status_code=502, detail=f"Could not fetch Instagram media: {last_error}")
 
 
 @app.post("/resolve")
@@ -236,38 +257,28 @@ async def resolve(req: ResolveRequest, authorization: str | None = Header(defaul
     ensure_allowed(url)
     host = normalized_host(url)
     is_instagram = host in {"instagram.com", "www.instagram.com"}
-
     extraction_error = None
 
     try:
         from yt_dlp import YoutubeDL
-
         ydl_opts: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
             "noplaylist": False,
             "format": "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best",
-            "http_headers": INSTAGRAM_HEADERS if is_instagram else {"User-Agent": INSTAGRAM_HEADERS["User-Agent"]},
+            "http_headers": INSTAGRAM_HEADERS if is_instagram else {"User-Agent": IOS_UA},
         }
-
         cf = cookie_file()
         if cf:
             ydl_opts["cookiefile"] = cf
-
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-
         media = media_from_info(info or {})
         if media:
             if is_instagram:
                 media = proxy_instagram_media(media)
-            return {
-                "ok": True,
-                "source": host,
-                "title": (info or {}).get("title"),
-                "media": media,
-            }
+            return {"ok": True, "source": host, "title": (info or {}).get("title"), "media": media}
     except Exception as exc:
         extraction_error = str(exc)
 
@@ -276,21 +287,9 @@ async def resolve(req: ResolveRequest, authorization: str | None = Header(defaul
         if media:
             if is_instagram:
                 media = proxy_instagram_media(media)
-            return {
-                "ok": True,
-                "source": host,
-                "title": None,
-                "media": media,
-                "fallback": "opengraph",
-            }
+            return {"ok": True, "source": host, "title": None, "media": media, "fallback": "opengraph"}
     except Exception as exc:
         if not extraction_error:
             extraction_error = str(exc)
 
-    raise HTTPException(
-        status_code=422,
-        detail={
-            "message": "Could not resolve downloadable media. The post may be private, login-only, deleted, or unsupported.",
-            "extractor": extraction_error,
-        },
-    )
+    raise HTTPException(status_code=422, detail={"message": "Could not resolve downloadable media. The post may be private, login-only, deleted, or unsupported.", "extractor": extraction_error})
