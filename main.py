@@ -13,7 +13,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, HttpUrl
 
-app = FastAPI(title="SocMed Resolver", version="1.0.3")
+app = FastAPI(title="SocMed Resolver", version="1.0.4")
 
 ALLOWED_HOSTS = {
     "instagram.com", "www.instagram.com",
@@ -89,10 +89,11 @@ def guess_ext(url: str, fallback: str) -> str:
     return m.group(1) if m else fallback
 
 
-def sign_media_url(remote_url: str) -> str:
+def sign_media_url(remote_url: str, ext: str = "bin") -> str:
     payload = base64.urlsafe_b64encode(remote_url.encode()).decode().rstrip("=")
     signature = hmac.new(MEDIA_SIGNING_KEY, payload.encode(), hashlib.sha256).hexdigest()[:32]
-    return f"{PUBLIC_BASE_URL}/media/{payload}.{signature}"
+    safe_ext = ext.lower() if ext.lower() in {"jpg", "jpeg", "png", "webp", "gif", "mp4", "mov", "m4v"} else "bin"
+    return f"{PUBLIC_BASE_URL}/media/{payload}.{signature}/instagram-media.{safe_ext}"
 
 
 def decode_media_token(token: str) -> str:
@@ -117,7 +118,7 @@ def proxy_instagram_media(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         copy = dict(item)
         remote = copy.get("url")
         if remote:
-            copy["url"] = sign_media_url(remote)
+            copy["url"] = sign_media_url(remote, str(copy.get("ext") or "bin"))
         proxied.append(copy)
     return proxied
 
@@ -200,16 +201,16 @@ def detect_media(data: bytes, declared_type: str, remote_url: str) -> tuple[str,
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "socmed-resolver", "version": "1.0.3"}
+    return {"ok": True, "service": "socmed-resolver", "version": "1.0.4"}
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "1.0.3"}
+    return {"ok": True, "version": "1.0.4"}
 
 
-@app.get("/media/{token}")
-async def media_proxy(token: str):
+@app.get("/media/{token}/{filename}")
+async def media_proxy(token: str, filename: str):
     remote_url = decode_media_token(token)
     header_profiles = [
         {"User-Agent": IOS_UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"},
