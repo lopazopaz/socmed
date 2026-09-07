@@ -8,11 +8,11 @@ Private social-media media resolver intended for an iOS Shortcut.
 
 Supported host families include Instagram, TikTok, X/Twitter, Reddit, Facebook, and Pinterest.
 
-The service first tries `yt-dlp`, then falls back to Open Graph media metadata when possible.
+Instagram uses the third-party InstaSave extraction endpoint and returns original Instagram CDN media URLs for all extracted items. Shared Instagram post URLs are sent to that service. Its interface is undocumented and can change; failures return HTTP 502 rather than a misleading preview image. Download links expire, so resolve again for a fresh download. Other sites first use `yt-dlp`, then Open Graph metadata when possible.
 
 ## Deploy on Wasmer Edge
 
-Wasmer can auto-detect this repository as a Python/FastAPI app because it contains `requirements.txt` and `app.py`.
+Wasmer can auto-detect this repository as a Python/FastAPI app using `requirements.txt` and the `main:app` entrypoint pinned in `app.yaml`.
 
 1. In Wasmer, create/import an app from GitHub.
 2. Choose `lopazopaz/socmed` and the `main` branch.
