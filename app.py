@@ -9,9 +9,8 @@ import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, HttpUrl
-from yt_dlp import YoutubeDL
 
-app = FastAPI(title="SocMed Resolver", version="1.0.0")
+app = FastAPI(title="SocMed Resolver", version="1.0.1")
 
 ALLOWED_HOSTS = {
     "instagram.com", "www.instagram.com",
@@ -33,8 +32,7 @@ class ResolveRequest(BaseModel):
 def require_auth(authorization: str | None) -> None:
     if not API_KEY:
         return
-    expected = f"Bearer {API_KEY}"
-    if authorization != expected:
+    if authorization != f"Bearer {API_KEY}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -61,6 +59,23 @@ def cookie_file() -> str | None:
         return None
 
 
+def dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    result = []
+    for item in items:
+        url = item.get("url")
+        if url and url not in seen:
+            seen.add(url)
+            result.append(item)
+    return result
+
+
+def guess_ext(url: str, fallback: str) -> str:
+    path = urlparse(url).path.lower()
+    m = re.search(r"\.([a-z0-9]{2,5})$", path)
+    return m.group(1) if m else fallback
+
+
 def media_from_info(info: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
 
@@ -80,46 +95,27 @@ def media_from_info(info: dict[str, Any]) -> list[dict[str, Any]]:
     video_exts = {"mp4", "mov", "m4v", "webm"}
 
     if direct_url:
-        if ext in image_exts or (vcodec == "none" and acodec == "none" and ext in image_exts):
-            out.append({"type": "image", "url": direct_url, "ext": ext or "jpg"})
+        if ext in image_exts:
+            out.append({"type": "image", "url": direct_url, "ext": ext})
         elif ext in video_exts or (vcodec not in (None, "none") and acodec not in (None, "none")):
             out.append({"type": "video", "url": direct_url, "ext": ext or "mp4"})
 
-    # Some extractors expose direct media through requested_downloads.
     for item in info.get("requested_downloads") or []:
         url = item.get("url")
         if not url:
             continue
         item_ext = (item.get("ext") or "").lower()
-        if item_ext in image_exts:
-            out.append({"type": "image", "url": url, "ext": item_ext})
-        else:
-            out.append({"type": "video", "url": url, "ext": item_ext or "mp4"})
+        out.append({
+            "type": "image" if item_ext in image_exts else "video",
+            "url": url,
+            "ext": item_ext or "mp4",
+        })
 
-    # Image posts sometimes surface only as thumbnails.
-    if not out:
-        thumb = info.get("thumbnail")
-        if thumb:
-            out.append({"type": "image", "url": thumb, "ext": guess_ext(thumb, "jpg")})
+    if not out and info.get("thumbnail"):
+        thumb = info["thumbnail"]
+        out.append({"type": "image", "url": thumb, "ext": guess_ext(thumb, "jpg")})
 
     return dedupe(out)
-
-
-def dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    result = []
-    for item in items:
-        url = item.get("url")
-        if url and url not in seen:
-            seen.add(url)
-            result.append(item)
-    return result
-
-
-def guess_ext(url: str, fallback: str) -> str:
-    path = urlparse(url).path.lower()
-    m = re.search(r"\.([a-z0-9]{2,5})$", path)
-    return m.group(1) if m else fallback
 
 
 async def og_fallback(url: str) -> list[dict[str, Any]]:
@@ -127,23 +123,22 @@ async def og_fallback(url: str) -> list[dict[str, Any]]:
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
     }
     async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers=headers) as client:
-        r = await client.get(url)
-        r.raise_for_status()
+        response = await client.get(url)
+        response.raise_for_status()
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(response.text, "html.parser")
     media: list[dict[str, Any]] = []
 
-    video_props = ["og:video:secure_url", "og:video", "twitter:player:stream"]
-    image_props = ["og:image:secure_url", "og:image", "twitter:image"]
-
-    for prop in video_props:
-        for tag in soup.find_all("meta", attrs={"property": prop}) + soup.find_all("meta", attrs={"name": prop}):
+    for prop in ["og:video:secure_url", "og:video", "twitter:player:stream"]:
+        tags = soup.find_all("meta", attrs={"property": prop}) + soup.find_all("meta", attrs={"name": prop})
+        for tag in tags:
             content = tag.get("content")
             if content:
                 media.append({"type": "video", "url": content, "ext": guess_ext(content, "mp4")})
 
-    for prop in image_props:
-        for tag in soup.find_all("meta", attrs={"property": prop}) + soup.find_all("meta", attrs={"name": prop}):
+    for prop in ["og:image:secure_url", "og:image", "twitter:image"]:
+        tags = soup.find_all("meta", attrs={"property": prop}) + soup.find_all("meta", attrs={"name": prop})
+        for tag in tags:
             content = tag.get("content")
             if content:
                 media.append({"type": "image", "url": content, "ext": guess_ext(content, "jpg")})
@@ -153,12 +148,12 @@ async def og_fallback(url: str) -> list[dict[str, Any]]:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "socmed-resolver", "version": "1.0.0"}
+    return {"ok": True, "service": "socmed-resolver", "version": "1.0.1"}
 
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "version": "1.0.1"}
 
 
 @app.post("/resolve")
@@ -167,26 +162,32 @@ async def resolve(req: ResolveRequest, authorization: str | None = Header(defaul
     url = str(req.url)
     ensure_allowed(url)
 
-    ydl_opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": False,
-        # Prefer one already-muxed file so iOS can save it without ffmpeg.
-        "format": "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best",
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
-        },
-    }
-
-    cf = cookie_file()
-    if cf:
-        ydl_opts["cookiefile"] = cf
-
     extraction_error = None
+
     try:
+        # Lazy import keeps app startup healthy on runtimes where yt-dlp may have
+        # optional-platform incompatibilities. If import/extraction fails, we
+        # still fall back to Open Graph media discovery below.
+        from yt_dlp import YoutubeDL
+
+        ydl_opts: dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": False,
+            "format": "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best",
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
+            },
+        }
+
+        cf = cookie_file()
+        if cf:
+            ydl_opts["cookiefile"] = cf
+
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+
         media = media_from_info(info or {})
         if media:
             return {
