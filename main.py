@@ -1,11 +1,13 @@
 import base64
 import hashlib
 import hmac
+import html
+import json
 import os
 import re
 import tempfile
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import httpx
 from bs4 import BeautifulSoup
@@ -13,7 +15,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, HttpUrl
 
-app = FastAPI(title="SocMed Resolver", version="1.0.4")
+app = FastAPI(title="SocMed Resolver", version="1.0.5")
 
 ALLOWED_HOSTS = {
     "instagram.com", "www.instagram.com",
@@ -180,6 +182,55 @@ async def og_fallback(url: str) -> list[dict[str, Any]]:
     return dedupe(media)
 
 
+
+def instasave_media(script: str) -> list[dict[str, Any]]:
+    # Decode JavaScript string escapes as text; never execute provider code.
+    decoded = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m[1], 16)), script)
+    decoded = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m[1], 16)), decoded)
+    decoded = decoded.replace("\\/", "/").replace("\\'", "'").replace('\\"', '"')
+    soup = BeautifulSoup(decoded, "html.parser")
+    media = []
+    for anchor in soup.select(".download-items__btn a[href]"):
+        url = html.unescape(anchor["href"])
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname != "cdn.instasave.website":
+            continue
+        # Filename metadata determines type; it is not used for authorization.
+        try:
+            token = parse_qs(parsed.query)["token"][0]
+            payload = token.split(".")[1]
+            metadata = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            filename = metadata["filename"]
+            ext = filename.rsplit(".", 1)[-1].lower()
+        except (KeyError, IndexError, ValueError, TypeError):
+            continue
+        if ext not in {"jpg", "jpeg", "png", "webp", "gif", "mp4", "mov", "m4v"}:
+            continue
+        remote = metadata.get("url", "")
+        remote_host = normalized_host(remote)
+        if urlparse(remote).scheme != "https" or not any(
+            remote_host == domain or remote_host.endswith("." + domain)
+            for domain in ("cdninstagram.com", "fbcdn.net")
+        ):
+            continue
+        media.append({"type": "video" if ext in {"mp4", "mov", "m4v"} else "image",
+                      "url": remote, "ext": ext})
+    return dedupe(media)
+
+
+async def resolve_instagram(url: str) -> list[dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            "https://api.instasave.website/media",
+            data={"url": url.split("?", 1)[0], "lang": "en"},
+        )
+        response.raise_for_status()
+    media = instasave_media(response.text)
+    if not media:
+        raise ValueError("Instagram provider returned no downloadable media")
+    return media
+
+
 def detect_media(data: bytes, declared_type: str, remote_url: str) -> tuple[str, str] | None:
     declared = (declared_type or "").split(";", 1)[0].lower()
     if data.startswith(b"\xff\xd8\xff"):
@@ -201,12 +252,12 @@ def detect_media(data: bytes, declared_type: str, remote_url: str) -> tuple[str,
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "socmed-resolver", "version": "1.0.4"}
+    return {"ok": True, "service": "socmed-resolver", "version": "1.0.5"}
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "1.0.4"}
+    return {"ok": True, "version": "1.0.5"}
 
 
 @app.get("/media/{token}/{filename}")
@@ -259,6 +310,16 @@ async def resolve(req: ResolveRequest, authorization: str | None = Header(defaul
     host = normalized_host(url)
     is_instagram = host in {"instagram.com", "www.instagram.com"}
     extraction_error = None
+
+    if is_instagram:
+        try:
+            media = await resolve_instagram(url)
+            return {"ok": True, "source": host, "title": None,
+                    "media": media, "provider": "instasave"}
+        except Exception:
+            raise HTTPException(status_code=502, detail={
+                "message": "Instagram download provider is unavailable or could not extract this post. Please try again later."
+            })
 
     try:
         from yt_dlp import YoutubeDL
