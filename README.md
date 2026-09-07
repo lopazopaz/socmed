@@ -8,7 +8,7 @@ Private social-media media resolver intended for an iOS Shortcut.
 
 Supported host families include Instagram, TikTok, X/Twitter, Reddit, Facebook, and Pinterest.
 
-Instagram uses the third-party InstaSave extraction endpoint and returns original Instagram CDN media URLs for all extracted items. Shared Instagram post URLs are sent to that service. Its interface is undocumented and can change; failures return HTTP 502 rather than a misleading preview image. Download links expire, so resolve again for a fresh download. Other sites first use `yt-dlp`, then Open Graph metadata when possible.
+Instagram uses the third-party InstaSave extraction endpoint and returns signed server download links for all extracted items. The server fetches the original Instagram CDN URL unchanged and delivers image/video bytes with a filename and content type. Shared Instagram post URLs are sent to that service. Its interface is undocumented and can change; failures return HTTP 502 rather than a misleading preview image. Download links expire, so resolve again for a fresh download. Other sites first use `yt-dlp`, then Open Graph metadata when possible.
 
 ## Deploy on Wasmer Edge
 
