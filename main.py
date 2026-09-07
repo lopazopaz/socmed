@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import hmac
 import os
 import re
 import tempfile
@@ -8,9 +10,10 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl
 
-app = FastAPI(title="SocMed Resolver", version="1.0.1")
+app = FastAPI(title="SocMed Resolver", version="1.0.2")
 
 ALLOWED_HOSTS = {
     "instagram.com", "www.instagram.com",
@@ -23,6 +26,15 @@ ALLOWED_HOSTS = {
 
 API_KEY = os.getenv("SOCMED_API_KEY", "").strip()
 COOKIES_B64 = os.getenv("COOKIES_B64", "").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://socmed.wasmer.app").rstrip("/")
+MEDIA_SIGNING_KEY = (os.getenv("SOCMED_MEDIA_SECRET", "").strip() or API_KEY or "socmed-local-media-key").encode()
+
+INSTAGRAM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
+    "Referer": "https://www.instagram.com/",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 class ResolveRequest(BaseModel):
@@ -76,6 +88,39 @@ def guess_ext(url: str, fallback: str) -> str:
     return m.group(1) if m else fallback
 
 
+def sign_media_url(remote_url: str) -> str:
+    payload = base64.urlsafe_b64encode(remote_url.encode()).decode().rstrip("=")
+    signature = hmac.new(MEDIA_SIGNING_KEY, payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{PUBLIC_BASE_URL}/media/{payload}.{signature}"
+
+
+def decode_media_token(token: str) -> str:
+    try:
+        payload, signature = token.rsplit(".", 1)
+        expected = hmac.new(MEDIA_SIGNING_KEY, payload.encode(), hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("bad signature")
+        padded = payload + "=" * (-len(payload) % 4)
+        url = base64.urlsafe_b64decode(padded.encode()).decode()
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("bad url")
+        return url
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid media token")
+
+
+def proxy_instagram_media(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    proxied: list[dict[str, Any]] = []
+    for item in items:
+        copy = dict(item)
+        remote = copy.get("url")
+        if remote:
+            copy["url"] = sign_media_url(remote)
+        proxied.append(copy)
+    return proxied
+
+
 def media_from_info(info: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
 
@@ -119,10 +164,7 @@ def media_from_info(info: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 async def og_fallback(url: str) -> list[dict[str, Any]]:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
-    }
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers=headers) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers=INSTAGRAM_HEADERS) as client:
         response = await client.get(url)
         response.raise_for_status()
 
@@ -148,12 +190,43 @@ async def og_fallback(url: str) -> list[dict[str, Any]]:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "socmed-resolver", "version": "1.0.1"}
+    return {"ok": True, "service": "socmed-resolver", "version": "1.0.2"}
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "1.0.1"}
+    return {"ok": True, "version": "1.0.2"}
+
+
+@app.get("/media/{token}")
+async def media_proxy(token: str):
+    remote_url = decode_media_token(token)
+
+    async def stream_remote():
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60, headers=INSTAGRAM_HEADERS) as client:
+            async with client.stream("GET", remote_url) as response:
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+
+    # Probe headers first so iOS receives the actual MIME type instead of generic data.
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers=INSTAGRAM_HEADERS) as client:
+            async with client.stream("GET", remote_url) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "application/octet-stream").split(";", 1)[0]
+                content_length = response.headers.get("content-length")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch media: {exc}")
+
+    headers = {
+        "Cache-Control": "private, max-age=300",
+        "Content-Disposition": "inline",
+    }
+    if content_length:
+        headers["Content-Length"] = content_length
+
+    return StreamingResponse(stream_remote(), media_type=content_type, headers=headers)
 
 
 @app.post("/resolve")
@@ -161,6 +234,8 @@ async def resolve(req: ResolveRequest, authorization: str | None = Header(defaul
     require_auth(authorization)
     url = str(req.url)
     ensure_allowed(url)
+    host = normalized_host(url)
+    is_instagram = host in {"instagram.com", "www.instagram.com"}
 
     extraction_error = None
 
@@ -173,9 +248,7 @@ async def resolve(req: ResolveRequest, authorization: str | None = Header(defaul
             "skip_download": True,
             "noplaylist": False,
             "format": "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best",
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
-            },
+            "http_headers": INSTAGRAM_HEADERS if is_instagram else {"User-Agent": INSTAGRAM_HEADERS["User-Agent"]},
         }
 
         cf = cookie_file()
@@ -187,9 +260,11 @@ async def resolve(req: ResolveRequest, authorization: str | None = Header(defaul
 
         media = media_from_info(info or {})
         if media:
+            if is_instagram:
+                media = proxy_instagram_media(media)
             return {
                 "ok": True,
-                "source": normalized_host(url),
+                "source": host,
                 "title": (info or {}).get("title"),
                 "media": media,
             }
@@ -199,9 +274,11 @@ async def resolve(req: ResolveRequest, authorization: str | None = Header(defaul
     try:
         media = await og_fallback(url)
         if media:
+            if is_instagram:
+                media = proxy_instagram_media(media)
             return {
                 "ok": True,
-                "source": normalized_host(url),
+                "source": host,
                 "title": None,
                 "media": media,
                 "fallback": "opengraph",
