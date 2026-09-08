@@ -7,7 +7,7 @@ import os
 import re
 import tempfile
 from typing import Any
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -15,7 +15,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, HttpUrl
 
-app = FastAPI(title="SocMed Resolver", version="1.0.7")
+app = FastAPI(title="SocMed Resolver", version="1.1.0")
 
 ALLOWED_HOSTS = {
     "instagram.com", "www.instagram.com",
@@ -25,6 +25,9 @@ ALLOWED_HOSTS = {
     "facebook.com", "www.facebook.com", "fb.watch",
     "pinterest.com", "www.pinterest.com", "pin.it",
 }
+
+TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"}
+INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com"}
 
 API_KEY = os.getenv("SOCMED_API_KEY", "").strip()
 COOKIES_B64 = os.getenv("COOKIES_B64", "").strip()
@@ -38,6 +41,12 @@ INSTAGRAM_HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
 }
+TIKTOK_HEADERS = {
+    "User-Agent": IOS_UA,
+    "Referer": "https://www.tiktok.com/",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 class ResolveRequest(BaseModel):
@@ -45,9 +54,7 @@ class ResolveRequest(BaseModel):
 
 
 def require_auth(authorization: str | None) -> None:
-    if not API_KEY:
-        return
-    if authorization != f"Bearer {API_KEY}":
+    if API_KEY and authorization != f"Bearer {API_KEY}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -76,7 +83,7 @@ def cookie_file() -> str | None:
 
 def dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
-    result = []
+    result: list[dict[str, Any]] = []
     for item in items:
         url = item.get("url")
         if url and url not in seen:
@@ -86,43 +93,8 @@ def dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def guess_ext(url: str, fallback: str) -> str:
-    path = urlparse(url).path.lower()
-    m = re.search(r"\.([a-z0-9]{2,5})$", path)
+    m = re.search(r"\.([a-z0-9]{2,5})$", urlparse(url).path.lower())
     return m.group(1) if m else fallback
-
-
-def sign_media_url(remote_url: str, ext: str = "bin") -> str:
-    payload = base64.urlsafe_b64encode(remote_url.encode()).decode().rstrip("=")
-    signature = hmac.new(MEDIA_SIGNING_KEY, payload.encode(), hashlib.sha256).hexdigest()[:32]
-    safe_ext = ext.lower() if ext.lower() in {"jpg", "jpeg", "png", "webp", "gif", "mp4", "mov", "m4v"} else "bin"
-    return f"{PUBLIC_BASE_URL}/download/instagram-media.{safe_ext}?token={payload}.{signature}"
-
-
-def decode_media_token(token: str) -> str:
-    try:
-        payload, signature = token.rsplit(".", 1)
-        expected = hmac.new(MEDIA_SIGNING_KEY, payload.encode(), hashlib.sha256).hexdigest()[:32]
-        if not hmac.compare_digest(signature, expected):
-            raise ValueError("bad signature")
-        padded = payload + "=" * (-len(payload) % 4)
-        url = base64.urlsafe_b64decode(padded.encode()).decode()
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("bad url")
-        return url
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid media token")
-
-
-def proxy_instagram_media(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    proxied: list[dict[str, Any]] = []
-    for item in items:
-        copy = dict(item)
-        remote = copy.get("url")
-        if remote:
-            copy["url"] = sign_media_url(remote, str(copy.get("ext") or "bin"))
-        proxied.append(copy)
-    return proxied
 
 
 def media_from_info(info: dict[str, Any]) -> list[dict[str, Any]]:
@@ -152,17 +124,38 @@ def media_from_info(info: dict[str, Any]) -> list[dict[str, Any]]:
         if not item_url:
             continue
         item_ext = (item.get("ext") or "").lower()
-        out.append({"type": "image" if item_ext in image_exts else "video", "url": item_url, "ext": item_ext or "mp4"})
+        out.append({
+            "type": "image" if item_ext in image_exts else "video",
+            "url": item_url,
+            "ext": item_ext or "mp4",
+        })
 
     if not out and info.get("thumbnail"):
         thumb = info["thumbnail"]
         out.append({"type": "image", "url": thumb, "ext": guess_ext(thumb, "jpg")})
-
     return dedupe(out)
 
 
+def extract_ytdlp(url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    from yt_dlp import YoutubeDL
+
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": False,
+        "format": "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best",
+        "http_headers": headers or {"User-Agent": IOS_UA},
+    }
+    cf = cookie_file()
+    if cf:
+        opts["cookiefile"] = cf
+    with YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False) or {}
+
+
 async def og_fallback(url: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers=INSTAGRAM_HEADERS) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers={"User-Agent": IOS_UA}) as client:
         response = await client.get(url)
         response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
@@ -182,39 +175,39 @@ async def og_fallback(url: str) -> list[dict[str, Any]]:
     return dedupe(media)
 
 
-
 def instasave_media(script: str) -> list[dict[str, Any]]:
-    # Decode JavaScript string escapes as text; never execute provider code.
     decoded = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m[1], 16)), script)
     decoded = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m[1], 16)), decoded)
     decoded = decoded.replace("\\/", "/").replace("\\'", "'").replace('\\"', '"')
     soup = BeautifulSoup(decoded, "html.parser")
-    media = []
+    media: list[dict[str, Any]] = []
     for anchor in soup.select(".download-items__btn a[href]"):
-        url = html.unescape(anchor["href"])
-        parsed = urlparse(url)
+        provider_url = html.unescape(anchor["href"])
+        parsed = urlparse(provider_url)
         if parsed.scheme != "https" or parsed.hostname != "cdn.instasave.website":
             continue
-        # Filename metadata determines type; it is not used for authorization.
         try:
             token = parse_qs(parsed.query)["token"][0]
             payload = token.split(".")[1]
             metadata = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
             filename = metadata["filename"]
             ext = filename.rsplit(".", 1)[-1].lower()
+            remote = metadata.get("url", "")
         except (KeyError, IndexError, ValueError, TypeError):
             continue
         if ext not in {"jpg", "jpeg", "png", "webp", "gif", "mp4", "mov", "m4v"}:
             continue
-        remote = metadata.get("url", "")
         remote_host = normalized_host(remote)
         if urlparse(remote).scheme != "https" or not any(
             remote_host == domain or remote_host.endswith("." + domain)
             for domain in ("cdninstagram.com", "fbcdn.net")
         ):
             continue
-        media.append({"type": "video" if ext in {"mp4", "mov", "m4v"} else "image",
-                      "url": remote, "ext": ext})
+        media.append({
+            "type": "video" if ext in {"mp4", "mov", "m4v"} else "image",
+            "url": remote,
+            "ext": ext,
+        })
     return dedupe(media)
 
 
@@ -231,7 +224,6 @@ async def resolve_instagram(url: str) -> list[dict[str, Any]]:
     return media
 
 
-
 def instagram_shortcode(url: str) -> str:
     match = re.search(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", urlparse(url).path)
     if not match:
@@ -241,11 +233,39 @@ def instagram_shortcode(url: str) -> str:
 
 def instagram_delivery_urls(post_url: str, media: list[dict[str, Any]]) -> list[dict[str, Any]]:
     shortcode = instagram_shortcode(post_url)
-    delivered = []
+    delivered: list[dict[str, Any]] = []
     for index, item in enumerate(media):
-        copy = {key: value for key, value in item.items() if key != "url"}
+        copy = {k: v for k, v in item.items() if k != "url"}
         ext = str(copy.get("ext") or ("mp4" if copy.get("type") == "video" else "jpg"))
         copy["url"] = f"{PUBLIC_BASE_URL}/instagram/{shortcode}/{index}/media.{ext}"
+        delivered.append(copy)
+    return delivered
+
+
+def tiktok_identity(info: dict[str, Any]) -> tuple[str, str]:
+    candidates = [
+        str(info.get("webpage_url") or ""),
+        str(info.get("original_url") or ""),
+        str(info.get("url") or ""),
+    ]
+    for candidate in candidates:
+        match = re.search(r"/@([A-Za-z0-9._-]+)/video/(\d+)", candidate)
+        if match:
+            return match.group(1), match.group(2)
+    uploader = str(info.get("uploader_id") or info.get("uploader") or "").lstrip("@")
+    video_id = str(info.get("id") or "")
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", uploader) and re.fullmatch(r"\d{8,30}", video_id):
+        return uploader, video_id
+    raise ValueError("Could not determine TikTok video identity")
+
+
+def tiktok_delivery_urls(info: dict[str, Any], media: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    username, video_id = tiktok_identity(info)
+    delivered: list[dict[str, Any]] = []
+    for index, item in enumerate(media):
+        copy = {k: v for k, v in item.items() if k != "url"}
+        ext = str(copy.get("ext") or ("mp4" if copy.get("type") == "video" else "jpg"))
+        copy["url"] = f"{PUBLIC_BASE_URL}/tiktok/{username}/{video_id}/{index}/media.{ext}"
         delivered.append(copy)
     return delivered
 
@@ -264,19 +284,61 @@ def detect_media(data: bytes, declared_type: str, remote_url: str) -> tuple[str,
         return "video/mp4", "mp4"
     if declared.startswith("image/"):
         return declared, guess_ext(remote_url, declared.split("/", 1)[1].replace("jpeg", "jpg"))
-    if declared.startswith("video/"):
-        return declared, guess_ext(remote_url, "mp4")
+    if declared.startswith("video/") or declared in {"application/octet-stream", "binary/octet-stream"}:
+        return "video/mp4", guess_ext(remote_url, "mp4")
     return None
+
+
+async def fetch_remote_media(remote_url: str, filename: str = "media", referer: str | None = None):
+    profiles = [
+        {"User-Agent": IOS_UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"},
+    ]
+    if referer:
+        profiles.insert(0, {"User-Agent": IOS_UA, "Accept": "*/*", "Referer": referer, "Accept-Language": "en-US,en;q=0.9"})
+    profiles.extend([INSTAGRAM_HEADERS, TIKTOK_HEADERS])
+
+    last_error = "Remote server did not return valid media bytes"
+    async with httpx.AsyncClient(follow_redirects=True, timeout=90) as client:
+        for headers in profiles:
+            try:
+                response = await client.get(remote_url, headers=headers)
+                response.raise_for_status()
+                data = response.content
+                if not data:
+                    last_error = "Remote server returned an empty body"
+                    continue
+                head = data[:512].lstrip().lower()
+                if head.startswith(b"<!doctype html") or head.startswith(b"<html") or head.startswith(b"{"):
+                    last_error = "Remote server returned text instead of media"
+                    continue
+                detected = detect_media(data, response.headers.get("content-type", ""), remote_url)
+                if not detected:
+                    last_error = f"Unexpected content type: {response.headers.get('content-type', 'unknown')}"
+                    continue
+                media_type, ext = detected
+                stem = re.sub(r"[^A-Za-z0-9_-]", "-", filename.rsplit(".", 1)[0]) or "social-media"
+                return Response(
+                    content=data,
+                    media_type=media_type,
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{stem}.{ext}"',
+                        "Cache-Control": "private, max-age=300",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
+            except Exception as exc:
+                last_error = str(exc)
+    raise HTTPException(status_code=502, detail=f"Could not fetch media: {last_error}")
 
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "socmed-resolver", "version": "1.0.7"}
+    return {"ok": True, "service": "socmed-resolver", "version": "1.1.0"}
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "1.0.7"}
+    return {"ok": True, "version": "1.1.0"}
 
 
 @app.get("/instagram/{shortcode}/{index}/{filename}")
@@ -293,55 +355,55 @@ async def instagram_download(shortcode: str, index: int, filename: str):
         raise
     except Exception:
         raise HTTPException(status_code=502, detail="Could not retrieve Instagram download")
-    return await fetch_remote_media(remote_url, filename)
+    return await fetch_remote_media(remote_url, filename, "https://www.instagram.com/")
 
 
-async def fetch_remote_media(remote_url: str, filename: str = "media"):
-    header_profiles = [
-        {"User-Agent": IOS_UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"},
-        INSTAGRAM_HEADERS,
-        {"User-Agent": "Mozilla/5.0", "Accept": "*/*", "Referer": "https://www.instagram.com/"},
-    ]
-    last_error = "Instagram CDN did not return valid media bytes"
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-        for headers in header_profiles:
-            try:
-                response = await client.get(remote_url, headers=headers)
-                response.raise_for_status()
-                data = response.content
-                if not data:
-                    last_error = "Instagram CDN returned an empty body"
-                    continue
-                head = data[:512].lstrip().lower()
-                if head.startswith(b"<!doctype html") or head.startswith(b"<html"):
-                    last_error = "Instagram CDN returned HTML instead of media"
-                    continue
-                detected = detect_media(data, response.headers.get("content-type", ""), remote_url)
-                if not detected:
-                    last_error = f"Unexpected content type: {response.headers.get('content-type', 'unknown')}"
-                    continue
-                media_type, ext = detected
-                stem = re.sub(r"[^A-Za-z0-9_-]", "-", filename.rsplit(".", 1)[0]) or "instagram-media"
-                return Response(
-                    content=data,
-                    media_type=media_type,
-                    headers={
-                        "Content-Disposition": f'attachment; filename="{stem}.{ext}"',
-                        "Cache-Control": "private, max-age=300",
-                        "X-Content-Type-Options": "nosniff",
-                    },
-                )
-            except Exception as exc:
-                last_error = str(exc)
-    raise HTTPException(status_code=502, detail=f"Could not fetch Instagram media: {last_error}")
+@app.get("/tiktok/{username}/{video_id}/{index}/{filename}")
+async def tiktok_download(username: str, video_id: str, index: int, filename: str):
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", username):
+        raise HTTPException(status_code=400, detail="Invalid TikTok username")
+    if not re.fullmatch(r"\d{8,30}", video_id) or index < 0 or index > 50:
+        raise HTTPException(status_code=400, detail="Invalid TikTok media request")
+    post_url = f"https://www.tiktok.com/@{username}/video/{video_id}"
+    try:
+        info = extract_ytdlp(post_url, TIKTOK_HEADERS)
+        items = media_from_info(info)
+        if index >= len(items):
+            raise HTTPException(status_code=404, detail="TikTok media item not found")
+        remote_url = items[index]["url"]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not retrieve TikTok download: {exc}")
+    return await fetch_remote_media(remote_url, filename, "https://www.tiktok.com/")
+
+
+def sign_media_url(remote_url: str, ext: str = "bin") -> str:
+    payload = base64.urlsafe_b64encode(remote_url.encode()).decode().rstrip("=")
+    signature = hmac.new(MEDIA_SIGNING_KEY, payload.encode(), hashlib.sha256).hexdigest()[:32]
+    safe_ext = ext.lower() if ext.lower() in {"jpg", "jpeg", "png", "webp", "gif", "mp4", "mov", "m4v"} else "bin"
+    return f"{PUBLIC_BASE_URL}/download/social-media.{safe_ext}?token={payload}.{signature}"
+
+
+def decode_media_token(token: str) -> str:
+    try:
+        payload, signature = token.rsplit(".", 1)
+        expected = hmac.new(MEDIA_SIGNING_KEY, payload.encode(), hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("bad signature")
+        padded = payload + "=" * (-len(payload) % 4)
+        url = base64.urlsafe_b64decode(padded.encode()).decode()
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("bad url")
+        return url
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid media token")
 
 
 @app.get("/download/{filename}")
-@app.get("/media/{token}/{filename}")
-@app.get("/media/{token}")
-async def media_proxy(token: str, filename: str = "instagram-media"):
-    remote_url = decode_media_token(token)
-    return await fetch_remote_media(remote_url, filename)
+async def media_proxy(filename: str, token: str):
+    return await fetch_remote_media(decode_media_token(token), filename)
 
 
 @app.post("/resolve")
@@ -350,50 +412,54 @@ async def resolve(req: ResolveRequest, authorization: str | None = Header(defaul
     url = str(req.url)
     ensure_allowed(url)
     host = normalized_host(url)
-    is_instagram = host in {"instagram.com", "www.instagram.com"}
-    extraction_error = None
 
-    if is_instagram:
+    if host in INSTAGRAM_HOSTS:
         try:
             media = instagram_delivery_urls(url, await resolve_instagram(url))
-            return {"ok": True, "source": host, "title": None,
-                    "media": media, "provider": "instasave"}
+            return {"ok": True, "source": host, "title": None, "media": media, "provider": "instasave"}
         except Exception:
             raise HTTPException(status_code=502, detail={
                 "message": "Instagram download provider is unavailable or could not extract this post. Please try again later."
             })
 
+    if host in TIKTOK_HOSTS:
+        try:
+            info = extract_ytdlp(url, TIKTOK_HEADERS)
+            media = media_from_info(info)
+            if not media:
+                raise ValueError("TikTok extractor returned no media")
+            delivered = tiktok_delivery_urls(info, media)
+            return {
+                "ok": True,
+                "source": host,
+                "title": info.get("title"),
+                "media": delivered,
+                "provider": "yt-dlp-tiktok",
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail={
+                "message": "Could not extract this TikTok. The video may be private, deleted, region-restricted, or require login.",
+                "extractor": str(exc),
+            })
+
+    extraction_error = None
     try:
-        from yt_dlp import YoutubeDL
-        ydl_opts: dict[str, Any] = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "noplaylist": False,
-            "format": "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best",
-            "http_headers": INSTAGRAM_HEADERS if is_instagram else {"User-Agent": IOS_UA},
-        }
-        cf = cookie_file()
-        if cf:
-            ydl_opts["cookiefile"] = cf
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        media = media_from_info(info or {})
+        info = extract_ytdlp(url)
+        media = media_from_info(info)
         if media:
-            if is_instagram:
-                media = proxy_instagram_media(media)
-            return {"ok": True, "source": host, "title": (info or {}).get("title"), "media": media}
+            return {"ok": True, "source": host, "title": info.get("title"), "media": media}
     except Exception as exc:
         extraction_error = str(exc)
 
     try:
         media = await og_fallback(url)
         if media:
-            if is_instagram:
-                media = proxy_instagram_media(media)
             return {"ok": True, "source": host, "title": None, "media": media, "fallback": "opengraph"}
     except Exception as exc:
         if not extraction_error:
             extraction_error = str(exc)
 
-    raise HTTPException(status_code=422, detail={"message": "Could not resolve downloadable media. The post may be private, login-only, deleted, or unsupported.", "extractor": extraction_error})
+    raise HTTPException(status_code=422, detail={
+        "message": "Could not resolve downloadable media. The post may be private, login-only, deleted, or unsupported.",
+        "extractor": extraction_error,
+    })
